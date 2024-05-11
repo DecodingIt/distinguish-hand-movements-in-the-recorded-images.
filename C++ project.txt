@@ -1,0 +1,460 @@
+#include <cstdio>
+#include <iostream>
+#include "utility.hpp"
+#include <cmath>
+#include "depthai/depthai.hpp"
+#include "opencv2/opencv.hpp"
+
+// Global variables
+
+static std::atomic<bool> downscaleColor{true};
+static constexpr int fps = 30;
+static constexpr auto monoRes = dai::monoCamProperties::SensorResolution::THE_720_P;
+static float rgbWeight = 0.4f;
+static float depthWeight = 0.6f;
+cv::Rect previousBoundingBox;
+double previousMeanDepth = 0.0;
+
+
+// Callback function to update blending weights
+static void updateBlendWeights(int percentRgb, void* ctx) {
+    rgbWeight = float(percentRgb) / 100.f;
+    depthWeight = 1.f - rgbWeight;
+}
+// Function to identify motion based on bounding box and depth information
+void identifyMotion(cv::Rect& largestBoundingBox, double meanDepth, cv::Rect& previousBoundingBox, double previousMeanDepth, cv::Mat frame) {
+    // Calculate differences in dimensions and depth
+    unsigned int diffleft;
+    unsigned int difftop;
+    double diffdepth;
+    diffleft = largestBoundingBox.width - previousBoundingBox.width;
+    difftop = largestBoundingBox.height - previousBoundingBox.height;
+    diffdepth = std::abs(previousMeanDepth - meanDepth);
+    // Display motion information on the frame
+    if (diffleft > 50) {
+        cv::putText(frame, "Movement: Left-Right", cv::Point(50, 80), cv::FONT_HERSHEY_SIMPLEX, 1, 255, 2);
+    };
+    if (difftop > 50) {
+        cv::putText(frame, "Movement: Up-Down", cv::Point(50, 120), cv::FONT_HERSHEY_SIMPLEX, 1, 255, 2);
+    };
+    if (diffdepth > 5) {
+        cv::putText(frame, "Movement: Front-Back", cv::Point(50, 160), cv::FONT_HERSHEY_SIMPLEX, 1, 255, 2);
+    };
+    if (diffleft <= 50 && difftop <= 50 && diffdepth <= 5) {
+        cv::putText(frame, "Movement: None", cv::Point(50, 80), cv::FONT_HERSHEY_SIMPLEX, 1, 255, 2);
+    };
+    cv::imshow("Binbild", frame);
+}
+// Function for region labeling in binary images
+void regionLabeling(cv::Mat& binaryImage, cv::Mat& labeledImage, std::vector<cv::Rect>& boundingBoxes, std::vector<double>& depths) {
+    cv::Mat labels, stats, centroids;
+    int numLabels = cv::connectedComponentsWithStats(binaryImage, labels, stats, centroids);
+    labeledImage = binaryImage.clone();
+    for (int label = 1; label < numLabels; ++label) {
+        cv::Rect boundingBox(stats.at<int>(label, cv::CC_STAT_LEFT),
+                             stats.at<int>(label, cv::CC_STAT_TOP),
+                             stats.at<int>(label, cv::CC_STAT_WIDTH),
+                             stats.at<int>(label, cv::CC_STAT_HEIGHT));
+        boundingBoxes.push_back(boundingBox);
+        cv::Mat depthValues = binaryImage(boundingBox);
+        double meanDepth = cv::mean(depthValues)[0];
+        depths.push_back(meanDepth);
+    }
+}
+// Function to analyze histogram of depth image
+void analyzehisto(cv::Mat inputImage) {
+    cv::Mat labeledImage;
+    cv::Mat stats;
+    cv::Mat centroids;
+    cv::Scalar color(0, 0, 255);
+
+    cv::Mat histogramm = cv::Mat(1, 256, CV_32FC1);
+    histogramm = cv::Scalar::all(0);
+    for (int i = 0; i < inputImage.cols; i++) {
+        for (int j = 0; j < inputImage.rows; ++j) {
+            histogramm.at<float>(inputImage.at<uchar>(j, i))++;
+        }
+    }
+
+    cv::Mat histImage = cv::Mat::ones(600, 320, CV_8U) * 255;
+    histImage = cv::Scalar::all(255);
+    cv::Mat smoothed;
+    cv::GaussianBlur(histogramm, smoothed, cv::Size(19, 19), 2.0);
+
+    double maximum;
+    cv::minMaxIdx(smoothed, NULL, &maximum);
+
+    int binW = cvRound((double)histImage.cols / 256);
+    for (int i = 0; i < 256; i++) {
+        line(histImage, cv::Point(i * binW, histImage.rows - (histImage.rows / maximum) * smoothed.at<float>(i)),
+             cv::Point((i + 1) * binW, histImage.rows - (histImage.rows / maximum) * smoothed.at<float>(i + 1)),
+             cv::Scalar(0, 0, 0));
+    }
+
+    double maximum;
+    minMaxIdx(inputImage, NULL, &maximum, NULL);
+    std::cout << "Depth maximum" << maximum << std::endl;
+    bool found200 = false;
+    int pointOf200;
+
+    for (int i = maximum; i > 0; i--) {
+        if (smoothed.at<float>(i) >= 200) {
+            std::cout << "200+ found at:" << i << "Val:" << smoothed.at<float>(i) << std::endl;
+            pointOf200 = i;
+            found200 = true;
+            break;
+        }
+    }
+
+    int localMax, localMin;
+    bool foundMax, foundMin = false;
+    if (found200) {
+        for (int i = pointOf200; i > 2; i--) {
+            if (smoothed.at<float>(i) > smoothed.at<float>(i - 1) && smoothed.at<float>(i - 1) > smoothed.at<float>(i - 2)) {
+                localMax = i - 1;
+                std::cout << "Local Maximum is at:" << i << std::endl;
+                line(histImage, cv::Point(i * binW, 0), cv::Point(i * binW, histImage.rows), cv::Scalar(0, 0, 255));
+                foundMax = true;
+                break;
+            }
+        }
+    }
+
+    if (foundMax) {
+        for (int i = localMax; i > 2; i--) {
+            if (smoothed.at<float>(i) < smoothed.at<float>(i - 1) && smoothed.at<float>(i - 1) < smoothed.at<float>(i - 2)) {
+                localMin = i - 1;
+                std::cout << "Local Mininmum is at:" << i << std::endl;
+                line(histImage, cv::Point(i * binW, 0), cv::Point(i * binW, histImage.rows), cv::Scalar(0, 0, 255));
+                foundMin = true;
+                break;
+            }
+        }
+    }
+
+    cv::imshow("Histogram", histImage);
+
+    cv::Mat biaryImg = inputImage >= localMin;
+
+    std::vector<cv::Rect> boundingBoxes;
+    std::vector<double> depths;
+
+    cv::Rect largestBoundingBox;
+    double meanDepth = 0.0;
+
+    regionLabeling(biaryImg, labeledImage, boundingBoxes, depths);
+
+    double maxArea = 0.0;
+    int maxIndex = -1;
+    for (int i = 0; i < boundingBoxes.size(); ++i) {
+        double area = boundingBoxes[i].width * boundingBoxes[i].height;
+        if (area > maxArea) {
+            maxArea = area;
+            maxIndex = i;
+        }
+    }
+
+    if (maxIndex != -1) {
+        largestBoundingBox = boundingBoxes[maxIndex];
+        meanDepth = depths[maxIndex];
+        cv::rectangle(labeledImage, largestBoundingBox, cv::Scalar(255), 1);
+    }
+
+    if (previousBoundingBox.area() > 0) {
+        identifyMotion(largestBoundingBox, meanDepth, previousBoundingBox, previousMeanDepth, labeledImage);
+    }
+
+    previousBoundingBox = largestBoundingBox;
+    previousMeanDepth = meanDepth;
+}
+
+// Function for camera functionality (recordFootage determines whether to record video or not)
+void cameraFunction(bool recordFootage) {
+    dai::Pipeline pipeline;
+    dai::Device device;
+    std::vector<std::string> queueNames;
+
+    auto camRgb = pipeline.create<dai::node::colorCam>();
+    auto left = pipeline.create<dai::node::monoCam>();
+    auto right = pipeline.create<dai::node::monoCam>();
+    auto stereo = pipeline.create<dai::node::depthStereo>();
+
+    stereo->setExtendedDisparity(true);
+
+    auto rgbOut = pipeline.create<dai::node::XLinkOut>();
+    auto depthOut = pipeline.create<dai::node::XLinkOut>();
+
+    rgbOut->setStreamName("rgb");
+    queueNames.push_back("rgb");
+    depthOut->setStreamName("depth");
+    queueNames.push_back("depth");
+
+    camRgb->setBoardSocket(dai::CameraBoardSocket::CAM_A);
+    camRgb->setResolution(dai::colorCamraProperties::SensorResolution::THE_1080_P);
+    camRgb->setFps(fps);
+
+    if (downscaleColor) camRgb->setIspScale(2, 3);
+
+    try {
+        auto calibData = device.readCalibration2();
+        auto lensPosition = calibData.getLensPosition(dai::CameraBoardSocket::CAM_A);
+        if (lensPosition) {
+            camRgb->initialControl.setManualFocus(lensPosition);
+        }
+    } catch (const std::exception &ex) {
+        std::cout << ex.what() << std::endl;
+        return;
+    }
+
+    left->setResolution(monoRes);
+    left->setCamera("left");
+    left->setFps(fps);
+
+    right->setResolution(monoRes);
+    right->setCamera("right");
+    right->setFps(fps);
+
+    stereo->setDefaultProfilePreset(dai::node::depthStereo::PresetMode::HIGH_DENSITY);
+    stereo->setLeftRightCheck(true);
+    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_A);
+
+    stereo->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_7x7);
+
+    auto config = stereo->initialConfig.get();
+    config.postProcessing.thresholdFilter.minRange = 500;
+    config.postProcessing.thresholdFilter.maxRange = 1000;
+
+    camRgb->isp.link(rgbOut->input);
+    left->out.link(stereo->left);
+    right->out.link(stereo->right);
+    stereo->disparity.link(depthOut->input);
+
+    device.startPipeline(pipeline);
+
+    auto stereo_depth = pipeline.create<dai::node::depthStereo>();
+    stereo_depth->initialConfig.setConfidenceThreshold(200);
+
+    for (const auto &name : queueNames) {
+        device.getOutputQueue(name, 4, false);
+    }
+
+    std::unordered_map<std::string, cv::Mat> frame;
+    auto rgbWindowName = "rgb";
+    auto depthWindowName = "depth";
+    cv::namedWindow(rgbWindowName);
+    if (!recordFootage) cv::namedWindow(depthWindowName);
+
+    std::vector<cv::Rect> boundingBoxes;
+    std::vector<double> depths;
+
+    cv::Rect largestBoundingBox;
+    double meanDepth = 0.0;
+    cv::Rect previousBoundingBox;
+    double previousMeanDepth = 0.0;
+
+    if (!recordFootage) {
+        while (true) {
+            std::unordered_map<std::string, std::shared_ptr<dai::ImgFrame>> latestPacket;
+            auto queueEvents = device.getQueueEvents(queueNames);
+
+            for (const auto &name : queueEvents) {
+                auto packets = device.getOutputQueue(name)->tryGetAll<dai::ImgFrame>();
+                auto count = packets.size();
+                if (count > 0) {
+                    latestPacket[name] = packets[count - 1];
+                }
+            }
+
+            for (const auto &name : queueNames) {
+                if (latestPacket.find(name) != latestPacket.end()) {
+                    if (name == depthWindowName) {
+                        frame[name] = latestPacket[name]->getFrame();
+                        auto maxDisparity = stereo->initialConfig.getMaxDisparity();
+                        if (1) frame[name].convertTo(frame[name], CV_8UC1, 255. / maxDisparity);
+                    } else {
+                        frame[name] = latestPacket[name]->getCvFrame();
+                    }
+
+                    cv::imshow(name, frame[name]);
+                    analyzehisto(frame[name]);
+                }
+            }
+
+            int key = cv::waitKey(1);
+            if (key == 'q' || key == 'Q') {
+                return;
+            }
+        }
+    } else {
+        cv::VideoWriter video_rgb("recording.avi", 0, fps, cv::Size(1280, 720), true);
+        cv::VideoWriter video_depth("depth.avi", 0, fps, cv::Size(1280, 720), false);
+
+        while (true) {
+            std::unordered_map<std::string, std::shared_ptr<dai::ImgFrame>> latestPacket;
+            auto queueEvents = device.getQueueEvents(queueNames);
+
+            for (const auto &name : queueEvents) {
+                auto packets = device.getOutputQueue(name)->tryGetAll<dai::ImgFrame>();
+                auto count = packets.size();
+                if (count > 0) {
+                    latestPacket[name] = packets[count - 1];
+                }
+            }
+
+            for (const auto &name : queueNames) {
+                if (latestPacket.find(name) != latestPacket.end()) {
+                    if (name == depthWindowName) {
+                        frame[name] = latestPacket[name]->getFrame();
+                        auto maxDisparity = stereo->initialConfig.getMaxDisparity();
+                        if (1) frame[name].convertTo(frame[name], CV_8UC1, 255. / maxDisparity);
+                        analyzehisto(frame[name]);
+                    } else {
+                        frame[name] = latestPacket[name]->getCvFrame();
+                    }
+
+                    cv::imshow(name, frame[name]);
+                }
+                video_rgb.write(frame[rgbWindowName]);
+                video_depth.write(frame[depthWindowName]);
+            }
+
+            int key = cv::waitKey(1);
+            if (key == 'q' || key == 'Q') {
+                video_depth.release();
+                video_rgb.release();
+                return;
+            }
+        }
+    }
+
+    return;
+}
+// Function to evaluate recorded video
+void evalVideo() {
+    using namespace cv;
+    VideoCapture
+
+
+    VideoCapture cap_rgb("recording.avi");
+    VideoCapture cap_depth("depth.avi");
+
+   
+    if(!cap_rgb.isOpened() || !cap_depth.isOpened())
+    {
+        std::cerr <<"Cannot Capture Video";
+        return;
+    }
+
+    Mat frame;
+    Mat frame_depth;
+    while (true) {
+        cap_rgb.read(frame);
+        if (frame.empty()) {
+            std::cout << "Empty rgb frame" << std::endl;
+            break;
+        }
+        cap_depth.read(frame_depth);
+        cvtColor(frame_depth, frame_depth, COLOR_BGR2GRAY);
+        if (frame_depth.empty()) {
+            std::cout << "Empty depth frame" << std::endl;
+            break;
+        }
+
+
+        imshow("RGB-Video", frame);
+        imshow("depth-video",frame_depth);
+        analyzehisto(frame_depth);
+
+        int key = cv::waitKey(0);
+        if (key == 'q' || key == 'Q') {
+            return;
+
+        }
+
+    }
+    return;
+}
+
+
+// Function to evaluate recorded video
+void evalVideo() {
+    using namespace cv;
+    // Open video capture objects for RGB and depth videos
+    VideoCapture cap_rgb("recording.avi");
+    VideoCapture cap_depth("depth.avi");
+
+    // Check if the video capture objects are opened successfully
+    if(!cap_rgb.isOpened() || !cap_depth.isOpened())
+    {
+        std::cerr <<"Cannot Capture Video";
+        return;
+    }
+
+    Mat frame;
+    Mat frame_depth;
+    while (true) {
+        // Read frames from RGB and depth videos
+        cap_rgb.read(frame);
+        if (frame.empty()) {
+            std::cout << "Empty rgb frame" << std::endl;
+            break;
+        }
+        cap_depth.read(frame_depth);
+        cvtColor(frame_depth, frame_depth, COLOR_BGR2GRAY);
+        if (frame_depth.empty()) {
+            std::cout << "Empty depth frame" << std::endl;
+            break;
+        }
+
+        // Display RGB and depth frames
+        imshow("RGB-Video", frame);
+        imshow("depth-video", frame_depth);
+
+        // Analyze depth histogram
+        analyzehisto(frame_depth);
+
+        // Wait for user input (key press)
+        int key = cv::waitKey(0);
+        if (key == 'q' || key == 'Q') {
+            return;
+        }
+    }
+    return;
+}
+
+// Main function to choose the mode of operation based on command-line input
+int main(int argc, char *argv[]) {
+    using namespace std;
+    using namespace cv;
+
+    // Check if the correct number of command-line arguments is provided
+    if (argc != 2) {
+        std::cout << "insert one number only" << std::endl;
+        return 0;
+    }
+
+    // Convert command-line argument to integer
+    int param = atoi(argv[1]);
+
+    // Switch case based on the chosen mode of operation
+    switch (param) {
+        case 1:
+            // Run camera function without recording footage
+            cameraFunction(false);
+            break;
+        case 2:
+            // Run camera function with recording footage
+            cameraFunction(true);
+            break;
+        case 3:
+            // Evaluate recorded video
+            evalVideo();
+            break;
+        default:
+            // Display an error message for invalid input
+            std::cout << "Please enter 1, 2, or 3 only." << std::endl;
+            return 0;
+    }
+
+    return 0;
+}
